@@ -1,0 +1,8 @@
+**/__pycache__/
+balor/
+xfiles/
+data/debug
+# Configuration files to ignore
+data/calibration_file.json
+data/galvo_settings.json
+data/screen-size.txt

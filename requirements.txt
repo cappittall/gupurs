@@ -1,0 +1,11 @@
+Jetson.GPIO
+numpy
+opencv_python
+opencv_python_headless
+Pillow
+pyusb
+Requests
+scipy
+shapely
+
+

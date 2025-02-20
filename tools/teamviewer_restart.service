@@ -1,0 +1,11 @@
+[Unit]
+Description=TeamViewer Restart Service
+After=network.target
+
+[Service]
+ExecStart=/home/jetson/teamviewer_restart.sh
+User=jetson
+Group=jetson
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,25 @@
+[{
+    "camera_source": "nvarguscamerasrc ! video/x-raw(memory:NVMM), width=1280, height=720, format=NV12, framerate=60/1 ! nvvidconv flip-method=2 ! video/x-raw, width=640, height=480, format=BGRx ! videoconvert ! video/x-raw, format=BGR ! appsink",
+    "galvo_calibration_file": "balor/jetsonCalibrationdeneme1.cor",
+    "calibration_file": "data/calibration_file.json",
+    "max_points_per_packet": 100,
+    "pixel_cm_ratio": 12.15,
+    "fabric_speed": 4,
+    "cm_to_galvo_x": 3152,
+    "cm_to_galvo_y": 3152,
+    "y_offset": 0,
+    "model_path": "models/best.pt"
+  },
+  
+  {
+    "camera_source": "data/output16m.mp4",
+    "galvo_calibration_file": "balor/jetsonCalibrationdeneme1.cor",
+    "calibration_file": "data/calibration_file.json",
+    "max_points_per_packet": 100,
+    "pixel_cm_ratio": 12.15,
+    "fabric_speed": 4,
+    "cm_to_galvo_x": 3152,
+    "cm_to_galvo_y": 3152,
+    "y_offset": 0,
+    "model_path": "models/best.pt"
+}]
