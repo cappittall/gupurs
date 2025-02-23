@@ -393,6 +393,10 @@ class LaserFabricCutter:
                     print(f"Error: Could not open video source: {self.video_path}")
                     return
                     
+                    
+                # Disable autofocus for Logitech C920
+                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # 0 disables autofocus
+                self.cap.set(cv2.CAP_PROP_FOCUS, 50)     # Set a fixed focus value (0-255, adjust as needed)
                 # Camera settings
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
