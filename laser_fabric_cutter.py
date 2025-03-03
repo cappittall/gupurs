@@ -393,7 +393,14 @@ class LaserFabricCutter:
                     print(f"Error: Could not open video source: {self.video_path}")
                     return
                     
-                    
+                            # Get the original video's frame rate
+                original_fps = self.cap.get(cv2.CAP_PROP_FPS)
+                if original_fps <= 0 or np.isnan(original_fps):
+                    original_fps = 30.0  # Default to 30fps if unable to determine
+                # Calculate the delay needed between frames to maintain original speed
+                frame_delay = 1.0 / original_fps
+            
+                                    
                 # Disable autofocus for Logitech C920
                 self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # 0 disables autofocus
                 self.cap.set(cv2.CAP_PROP_FOCUS, 50)     # Set a fixed focus value (0-255, adjust as needed)
@@ -402,6 +409,7 @@ class LaserFabricCutter:
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                 self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
                 self.cap.set(cv2.CAP_PROP_FPS, 60)
+                prev_frame_time = time.time()
                 
                 while self.cap.isOpened() and self.is_running:
                     ret, frame = self.cap.read()
@@ -413,8 +421,13 @@ class LaserFabricCutter:
                             print("Frame capture failed")
                             break
 
-                    self.process_frame(frame.copy(), frame_queue)
-                    time.sleep(0.01)
+                    self.process_frame(frame.copy(), frame_queue)               
+                    # Control frame rate to match original video
+                    current_time = time.time()
+                    elapsed = current_time - prev_frame_time
+                    sleep_time = max(0, frame_delay - elapsed)
+                    time.sleep(sleep_time)
+                    prev_frame_time = time.time() 
                     
         except Exception as e:
             print("Error in image processing:", e)
@@ -424,7 +437,7 @@ class LaserFabricCutter:
                 self.cap.release()
 
     # TODO
-    def process_frame(self, frame, frame_queue): 
+    def process_frameX(self, frame, frame_queue): 
         min_contour_area = 500      # Minimum contour area to consider
         offset_px = 25               # Laser offset in pixels
         blur_size = 5               # Size of Gaussian blur kernel
@@ -533,6 +546,149 @@ class LaserFabricCutter:
 
         # Always update the frame, even if no border is found
         self.update_frame_queue(frame, frame_queue)
+
+    def process_frame(self, frame, frame_queue): 
+        min_contour_area = 500      # Minimum contour area to consider
+        offset_px = 25              # Laser offset in pixels
+        blur_size = 5               # Size of Gaussian blur kernel
+        crop_pixels = 100           # Fixed pixels to crop from each side
+
+        slice_img = frame[self.slice_start:self.slice_end, :]
+        
+        # Get image width and ensure it's large enough for cropping
+        img_width = slice_img.shape[1]
+        
+        # Check if image is wide enough to crop
+        if img_width <= 2 * crop_pixels:
+            # Image too small for cropping, use original image
+            cropped_img = slice_img
+            left_edge = None
+            right_edge = None
+            crop_pixels = 0
+        else:
+            # Store the cropped edges for later
+            left_edge = slice_img[:, 0:crop_pixels].copy()
+            right_edge = slice_img[:, img_width-crop_pixels:img_width].copy()
+            
+            # Create the cropped image for processing
+            cropped_img = slice_img[:, crop_pixels:img_width-crop_pixels].copy()
+        
+        # Image processing steps
+        try:
+            # Convert to grayscale and blur
+            gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            
+            _, thresh = cv2.threshold(blurred, 120, 255, cv2.THRESH_BINARY_INV)
+            
+            # Find contours
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Process contours
+            s_contours = []
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                x, y, w, h = cv2.boundingRect(cnt)
+                
+                # Filter by area and height
+                if area > min_contour_area and h > self.slice_height*0.8:
+                    s_contours.append(cnt)
+                    
+            # Create point arrays
+            laser_points = []
+            for cnt in s_contours:
+                # Get centerline points
+                points = []
+                mask = np.zeros_like(gray)
+                cv2.drawContours(mask, [cnt], -1, 255, -1)
+                
+                for y in range(self.slice_height):
+                    row = mask[y,:]
+                    if np.any(row):
+                        left = np.argmax(row)
+                        right = len(row) - np.argmax(row[::-1]) - 1
+                        cx = (left + right) // 2
+                        points.append((cx, y))
+                
+                # Apply alternating offset
+                offset_points = []
+                for i, (x, y) in enumerate(points):
+                    if i % 2 == 0:
+                        offset_points.append((x + offset_px, y))
+                    else:
+                        offset_points.append((x - offset_px, y))
+                
+                laser_points.append(offset_points)
+                
+            colored_slice_bgr = cv2.cvtColor(gray.copy(), cv2.COLOR_GRAY2BGR)
+            for points in laser_points:
+                for x, y in points:
+                    cv2.circle(colored_slice_bgr, (x, y), 5, (0,0,255), -1)
+                    
+        except Exception as e:
+            logging.error(f"Error in processing frame: {e}")
+            traceback.print_exc()  # Print detailed error info
+            return
+        
+        self.calculate_loop_time()
+        
+        # Combine the processed middle with the original edges
+        if left_edge is not None and right_edge is not None:
+            # Only reconstruct if we actually cropped
+            full_processed = np.zeros_like(slice_img)
+            full_processed[:, 0:crop_pixels] = left_edge
+            full_processed[:, crop_pixels:img_width-crop_pixels] = colored_slice_bgr
+            full_processed[:, img_width-crop_pixels:img_width] = right_edge
+        else:
+            full_processed = colored_slice_bgr
+        
+        h = full_processed.shape[0]
+        slice_height = min(h, self.slice_height)
+        
+        # Make sure we're not exceeding frame dimensions
+        if self.slice_start + slice_height <= frame.shape[0]:
+            frame[self.slice_start:self.slice_start+slice_height, :] = full_processed[:slice_height]
+                        
+        # Adjust point coordinates to account for cropping
+        if laser_points:
+            new_points = set()
+            for contour_points in laser_points:
+                for point in contour_points:
+                    # Adjust x-coordinate by adding the crop width
+                    orig_x, orig_y = point
+                    adjusted_x = orig_x + crop_pixels  # Add back the crop offset
+                    
+                    self.point_x = adjusted_x
+                    self.point_y = orig_y + self.slice_start
+                    self.adjusted_x = self.point_x + self.galvo_offset_x
+                    self.adjusted_y = self.point_y + self.galvo_offset_y + self.galvo_settings['offset_y']
+
+                    # Convert to hexadecimal coordinates
+                    x_hex, y_hex = self.pixel_to_galvo_coordinates(self.adjusted_x, self.adjusted_y)
+                    point = (x_hex, y_hex)
+
+                    # Check if point is new and valid
+                    if point not in self.previous_points and self.is_valid_point(self.point_x, self.point_y):
+                        new_points.add(point)
+
+            # Add new unique points to the queue
+            for point in new_points:
+                self.send_point_to_galvo(*point)
+            
+            # Update previous_points with the new points        
+            self.previous_points = new_points
+
+        else:
+            logging.debug("No valid contours found. Skipping this frame.")
+            # Reset width, current_x, and previous_points when no border is found
+            self.width = 0
+            self.current_x = None
+            self.adjusted_y = None
+            self.previous_points.clear()
+
+        # Always update the frame, even if no border is found
+        self.update_frame_queue(frame, frame_queue)
+
 
     def is_valid_point(self, x, y):
         if not self.use_point_deviation:
