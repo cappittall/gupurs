@@ -143,13 +143,6 @@ class LaserFabricCutter:
         self.current_x_hex = 0
         self.current_y_hex = 0
         
-        # Add new parameters for channel selection
-        self.left_channel_start = self.galvo_settings['left_channel_start']
-        self.left_channel_end = self.galvo_settings['left_channel_end']
-        self.right_channel_start = self.galvo_settings['right_channel_start']
-        self.right_channel_end = self.galvo_settings['right_channel_end']
-        self.offset_px = self.galvo_settings['offset_px']
-    
         self.previous_points = set() 
                    
         self.lock = threading.Lock()
@@ -191,30 +184,14 @@ class LaserFabricCutter:
         with open(self.calibration_file, "w") as file:
             json.dump(calibration_data, file)
         print(f"Calibration saved: galvo_offset_x = {self.galvo_offset_x}, galvo_offset_y = {self.galvo_offset_y}")
-                           
+            
+                
     def save_settings(self):
         os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
         with open(self.settings_file, 'w') as f:
             json.dump(self.galvo_settings, f, indent=4)
-
-    def update_channel_boundaries(self, left_start, left_end, right_start, right_end):
-        with self.lock:
-            self.left_channel_start = left_start
-            self.left_channel_end = left_end
-            self.right_channel_start = right_start
-            self.right_channel_end = right_end
-            self.galvo_settings['left_channel_start'] = left_start
-            self.galvo_settings['left_channel_end'] = left_end
-            self.galvo_settings['right_channel_start'] = right_start
-            self.galvo_settings['right_channel_end'] = right_end
-            threading.Thread(target=self.save_settings()).start() 
-            print(f"Updated channel boundaries: Left({left_start}-{left_end}), Right({right_start}-{right_end})")
-
-    def update_offset_px(self, value):
-        with self.lock:
-            self.offset_px = value
-            print(f"Updated offset_px: {value}")
-                               
+                        
+    ## GALVO SETTING            
     def update_galvo_settings(self, setting_name, value):
         print(f"Updating {setting_name} to {value}")
         self.galvo_settings[setting_name] = value
@@ -223,7 +200,8 @@ class LaserFabricCutter:
             self.slice_height = int(value)
             
         threading.Thread(target=self.save_settings()).start()   
-                     
+               
+    # END galvo setting        
     def toggle_calibration_mode(self):
         self.calibration_mode = not self.calibration_mode
         print(f"Calibration mode: {'ON' if self.calibration_mode else 'OFF'}")
@@ -346,6 +324,110 @@ class LaserFabricCutter:
             return np.zeros((480, 640, 3), dtype=np.uint8)
         return self.current_frame
         
+    def validate_detection(self):
+        """Smart validation that handles excess or missing groups"""
+        self.is_validation_mode = True
+        validation_frame = self.get_current_frame().copy()
+        
+        # Detect all potential groups
+        detected_groups = self.detect_and_group_points(validation_frame)
+        
+        # Skip if no groups at all
+        if not detected_groups:
+            self.display_validation_result(validation_frame, [], False, "No groups detected")
+            return False
+        
+        # Sort groups by x-position for consistent ordering
+        sorted_groups = sorted(detected_groups, key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
+        
+        # Case 1: Exact match - we have 4 groups
+        if len(sorted_groups) == 4:
+            self.reference_groups = sorted_groups
+            self.display_validation_result(validation_frame, sorted_groups, True, "PASS - 4 groups detected")
+            self.initial_pattern_validated = True
+            return True
+        
+        # Case 2: Too many groups - select the best 4
+        elif len(sorted_groups) > 4:
+            # Filter groups based on spacing consistency and size
+            filtered_groups = self.filter_best_groups(sorted_groups)
+            
+            self.reference_groups = filtered_groups
+            self.display_validation_result(validation_frame, filtered_groups, True, 
+                                        f"PASS - Selected best 4 from {len(sorted_groups)} groups")
+            self.initial_pattern_validated = True
+            return True
+        
+        # Case 3: Too few groups - try to infer missing ones
+        elif 2 <= len(sorted_groups) < 4:
+            # Try to infer the missing groups based on pattern
+            complete_groups = self.infer_missing_groups(sorted_groups)
+            
+            if len(complete_groups) == 4:
+                self.reference_groups = complete_groups
+                self.display_validation_result(validation_frame, complete_groups, True, 
+                                            f"PASS - Inferred {4-len(sorted_groups)} missing groups")
+                self.initial_pattern_validated = True
+                return True
+            else:
+                self.display_validation_result(validation_frame, sorted_groups, False, 
+                                            f"FAIL - Could not infer missing groups. Need 4, found {len(sorted_groups)}")
+                self.initial_pattern_validated = False
+                return False
+        
+        # Case 4: Too few groups (less than 2) - can't reasonably infer
+        else:
+            self.display_validation_result(validation_frame, sorted_groups, False, 
+                                        f"FAIL - Not enough groups. Need 4, found {len(sorted_groups)}")
+            self.initial_pattern_validated = False
+            return False
+
+    def filter_best_groups(self, groups):
+        """Filter out unlikely groups to get the best 4 groups"""
+        if len(groups) <= 4:
+            return groups
+        
+        # Sort by x-position
+        sorted_groups = sorted(groups, key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
+        
+        # Calculate average horizontal spacing between adjacent groups
+        group_centers = [sum(p[0] for p in g)/len(g) for g in sorted_groups]
+        spacings = [group_centers[i+1] - group_centers[i] for i in range(len(group_centers)-1)]
+        
+        if not spacings:
+            return sorted_groups[:4]  # Fallback if spacing can't be calculated
+        
+        avg_spacing = sum(spacings) / len(spacings)
+        
+        # Score each group based on:
+        # 1. Size (number of points) - prefer larger groups
+        # 2. Spacing consistency - prefer groups that maintain consistent spacing
+        group_scores = []
+        
+        for i, group in enumerate(sorted_groups):
+            # Score based on size - larger is better
+            size_score = len(group) / max(len(g) for g in sorted_groups)
+            
+            # Score based on spacing consistency
+            spacing_score = 1.0
+            if 0 < i < len(sorted_groups) - 1:
+                # For middle groups, check spacing on both sides
+                left_spacing = group_centers[i] - group_centers[i-1]
+                right_spacing = group_centers[i+1] - group_centers[i]
+                spacing_diff = abs(left_spacing - right_spacing) / avg_spacing
+                spacing_score = 1.0 / (1.0 + spacing_diff)  # Higher score for more consistent spacing
+            
+            # Combined score (weight can be adjusted)
+            total_score = (size_score * 0.6) + (spacing_score * 0.4)
+            group_scores.append((i, total_score))
+        
+        # Sort by score and select top 4 indices
+        top_indices = [idx for idx, _ in sorted(group_scores, key=lambda x: x[1], reverse=True)[:4]]
+        top_indices.sort()  # Sort indices to maintain left-to-right order
+        
+        # Return the 4 best groups in proper order
+        return [sorted_groups[i] for i in top_indices]
+
     def infer_missing_groups(self, groups):
         """Infer missing groups based on spacing pattern"""
         if len(groups) >= 4:
@@ -483,7 +565,8 @@ class LaserFabricCutter:
         self.validation_frame = frame.copy()
       
     def detect_and_group_points(self, frame):
-        """Process frame to detect and group points by x-coordinate proximity within allowed channels"""
+        """Process frame to detect and group points by x-coordinate proximity"""
+        offset_px = 25
         slice_img = frame[self.slice_start:self.slice_end, :]
         
         # Apply existing image processing steps
@@ -500,14 +583,7 @@ class LaserFabricCutter:
             area = cv2.contourArea(cnt)
             x, y, w, h = cv2.boundingRect(cnt)
             
-            # Check if contour is within the allowed channel boundaries
-            contour_center_x = x + w/2
-            is_in_left_channel = (contour_center_x >= self.left_channel_start and 
-                                contour_center_x <= self.left_channel_end)
-            is_in_right_channel = (contour_center_x >= self.right_channel_start and 
-                                contour_center_x <= self.right_channel_end)
-            
-            if area > 500 and h > self.slice_height*0.8 and (is_in_left_channel or is_in_right_channel):
+            if area > 500 and h > self.slice_height*0.8:
                 valid_contours.append(cnt)
         
         # Extract centerline points from each contour
@@ -522,209 +598,67 @@ class LaserFabricCutter:
                     left = np.argmax(row)
                     right = len(row) - np.argmax(row[::-1]) - 1
                     cx = (left + right) // 2
-                    all_points.append((cx - self.offset_px, y + self.slice_start))
-                    all_points.append((cx + self.offset_px, y + self.slice_start))
+                    all_points.append((cx - offset_px, y + self.slice_start))
+                    all_points.append((cx + offset_px, y + self.slice_start))
         
-        # If no points detected, return empty list
+        # Group points by x-coordinate proximity
         if not all_points:
             return []
-        
-        # Group points using improved clustering
-        return self.cluster_points_into_four_groups(all_points)
-
-    def cluster_points_into_four_groups(self, points):
-        """
-        Cluster points into exactly four groups using a combination of
-        spatial clustering and domain knowledge about the expected pattern.
-        """
+            
         # Sort points by x-coordinate
-        points.sort(key=lambda p: p[0])
+        all_points.sort(key=lambda p: p[0])
         
-        # Step 1: Initial clustering based on x-coordinate gaps
-        x_values = [p[0] for p in points]
+        # Use a clustering approach with a larger gap threshold
+        x_values = [p[0] for p in all_points]
         
-        # Calculate gaps between adjacent x-coordinates
+        # Find large gaps to separate the groups
         gaps = [x_values[i+1] - x_values[i] for i in range(len(x_values)-1)]
         if not gaps:
-            return [points]  # Only one group if no gaps
-        
-        # Step 2: Use k-means clustering to find 4 clusters
-        try:
-            # Convert points to numpy array for k-means
-            points_array = np.array(points)
+            return [all_points]  # Only one group if no gaps
             
-            # Use only x-coordinates for clustering
-            x_coords = points_array[:, 0].reshape(-1, 1)
+        # Find the 3 largest gaps to separate 4 groups
+        if len(gaps) >= 3:
+            # Get indices of the 3 largest gaps
+            gap_indices = sorted(range(len(gaps)), key=lambda i: gaps[i], reverse=True)[:3]
+            gap_indices.sort()  # Sort in ascending order
             
-            # Apply k-means with k=4
-            from sklearn.cluster import KMeans
-            kmeans = KMeans(n_clusters=4, random_state=0, n_init=10).fit(x_coords)
+            # Create groups based on these gap positions
+            groups = []
+            start_idx = 0
             
-            # Get cluster labels
-            labels = kmeans.labels_
-            
-            # Create groups based on cluster labels
-            groups = [[] for _ in range(4)]
-            for i, point in enumerate(points):
-                groups[labels[i]].append(point)
-            
-            # Sort groups by x-coordinate (left to right)
-            groups.sort(key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
-            
-        except Exception as e:
-            # Fallback method if k-means fails
-            print(f"K-means clustering failed: {e}. Using fallback method.")
-            
-            # Find the 3 largest gaps to separate 4 groups
-            if len(gaps) >= 3:
-                gap_indices = sorted(range(len(gaps)), key=lambda i: gaps[i], reverse=True)[:3]
-                gap_indices.sort()  # Sort in ascending order
+            for gap_idx in gap_indices:
+                groups.append(all_points[start_idx:gap_idx+1])
+                start_idx = gap_idx + 1
                 
-                groups = []
-                start_idx = 0
-                for gap_idx in gap_indices:
-                    groups.append(points[start_idx:gap_idx+1])
-                    start_idx = gap_idx + 1
-                groups.append(points[start_idx:])
-            else:
-                # Not enough gaps, try to infer 4 groups based on expected pattern
-                groups = self.infer_four_groups(points)
-        
-        # Step 3: Optimize each group by reducing redundant points
-        optimized_groups = []
-        for group in groups:
-            optimized_group = self.optimize_point_group(group)
-            if optimized_group:  # Only add non-empty groups
-                optimized_groups.append(optimized_group)
-        
-        # Step 4: Ensure we have exactly 4 groups
-        while len(optimized_groups) > 4:
-            # Merge the two closest groups
-            min_distance = float('inf')
-            merge_indices = (0, 1)
-            
-            for i in range(len(optimized_groups)):
-                for j in range(i+1, len(optimized_groups)):
-                    g1_center = sum(p[0] for p in optimized_groups[i])/len(optimized_groups[i])
-                    g2_center = sum(p[0] for p in optimized_groups[j])/len(optimized_groups[j])
-                    distance = abs(g1_center - g2_center)
-                    
-                    if distance < min_distance:
-                        min_distance = distance
-                        merge_indices = (i, j)
-            
-            # Merge the two closest groups
-            i, j = merge_indices
-            optimized_groups[i].extend(optimized_groups[j])
-            optimized_groups.pop(j)
-        
-        # If we have fewer than 4 groups, try to infer the missing ones
-        while len(optimized_groups) < 4:
-            optimized_groups = self.infer_missing_groups(optimized_groups)
-            if len(optimized_groups) == len(self.infer_missing_groups(optimized_groups)):
-                # If inference didn't add any new groups, break to avoid infinite loop
-                break
-        
-        # Final sort by x-coordinate
-        optimized_groups.sort(key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
-        
-        return optimized_groups[:4]  # Return at most 4 groups
-
-    def optimize_point_group(self, points, max_points=10):
-        """
-        Optimize a group of points by:
-        1. Removing points that are too close to each other
-        2. Ensuring even distribution along the y-axis
-        3. Limiting the total number of points for efficiency
-        """
-        if not points:
-            return []
-        
-        # Sort points by y-coordinate (top to bottom)
-        points.sort(key=lambda p: p[1])
-        
-        # If we have few points, keep them all
-        if len(points) <= max_points:
-            return points
-        
-        # For larger groups, sample points evenly along the y-axis
-        optimized_points = []
-        
-        # Always include the first and last points
-        optimized_points.append(points[0])
-        
-        # Sample the middle points
-        step = (len(points) - 2) / (max_points - 2)
-        for i in range(1, max_points - 1):
-            idx = min(int(i * step), len(points) - 2)
-            optimized_points.append(points[idx])
-        
-        # Add the last point
-        optimized_points.append(points[-1])
-        
-        # Apply smoothing to the points if needed
-        if len(optimized_points) >= 3:
-            optimized_points = self.smooth_points(optimized_points)
-        
-        return optimized_points
-
-    def smooth_points(self, points, smoothness=0.2):
-        """
-        Apply smoothing to a series of points to create a more natural curve.
-        Uses scipy's spline interpolation.
-        """
-        try:
-            # Extract x and y coordinates
-            x = [p[0] for p in points]
-            y = [p[1] for p in points]
-            
-            # Check if we have enough unique points for spline
-            if len(set(y)) < 3:
-                return points  # Not enough unique points, return original
-            
-            # Create the spline
-            tck, u = splprep([x, y], s=smoothness, k=min(3, len(points)-1))
-            
-            # Evaluate the spline at evenly spaced points
-            new_u = np.linspace(0, 1, len(points))
-            new_points = splev(new_u, tck)
-            
-            # Convert back to the original format
-            smoothed_points = [(int(round(new_points[0][i])), int(round(new_points[1][i]))) 
-                            for i in range(len(new_points[0]))]
-            
-            return smoothed_points
-        except Exception as e:
-            print(f"Smoothing failed: {e}")
-            return points  # Return original points if smoothing fails
-
-    def infer_four_groups(self, points):
-        """
-        Attempt to infer 4 groups based on the expected pattern of two channels
-        with left and right edges.
-        """
-        # Calculate the frame width
-        frame_width = 1280  # Default width, adjust if needed
-        
-        # Divide the frame into 4 equal sections as a starting point
-        section_width = frame_width / 4
-        
-        groups = [[] for _ in range(4)]
-        
-        # Assign points to sections based on x-coordinate
-        for point in points:
-            section = min(3, int(point[0] / section_width))
-            groups[section].append(point)
-        
-        # Filter out empty groups
-        groups = [g for g in groups if g]
-        
-        # If we have fewer than 4 groups, try to infer the missing ones
-        if len(groups) < 4:
-            return self.infer_missing_groups(groups)
+            # Add the final group
+            groups.append(all_points[start_idx:])
+        else:
+            # Fallback if we don't have enough gaps
+            groups = [all_points]
         
         return groups
-                
+    
+    def exit_validation_mode(self):
+        """Exit validation mode but maintain continuous detection"""
+        self.is_validation_mode = False
+        
+        # Clear any validation-specific visualization
+        current_frame = self.get_current_frame().copy()
+        
+        # Reset the validation frame to ensure it doesn't persist
+        self.validation_frame = None
+        
+        # Ensure detection will continue on subsequent frames
+        if hasattr(self, 'frame_queue') and self.frame_queue is not None:
+            try:
+                while not self.frame_queue.empty():
+                    self.frame_queue.get_nowait()
+                # Put a clean frame to reset the display
+                self.frame_queue.put(current_frame)
+            except:
+                pass
+
+                    
     def process_video(self, frame_queue=None):
         print("Starting video processing...")
         if frame_queue is None:
@@ -818,7 +752,7 @@ class LaserFabricCutter:
                 self.cap.release()
 
     # TODO
-    def process_frameX(self, frame, frame_queue):
+    def process_frame(self, frame, frame_queue):
         """Process frame with improved detection and continuity checks"""
         # Get current groups of points
         current_groups = self.detect_and_group_points(frame)
@@ -834,16 +768,6 @@ class LaserFabricCutter:
             color = colors[i % len(colors)]
             for x, y in group:
                 cv2.circle(frame, (int(x), int(y)), 5, color, -1)
-                
-        # Draw channel boundaries
-        cv2.line(frame, (self.left_channel_start, self.slice_start), 
-                (self.left_channel_start, self.slice_end), (0, 255, 255), 2)
-        cv2.line(frame, (self.left_channel_end, self.slice_start), 
-                (self.left_channel_end, self.slice_end), (0, 255, 255), 2)
-        cv2.line(frame, (self.right_channel_start, self.slice_start), 
-                (self.right_channel_start, self.slice_end), (0, 255, 255), 2)
-        cv2.line(frame, (self.right_channel_end, self.slice_start), 
-                (self.right_channel_end, self.slice_end), (0, 255, 255), 2)
         
         # If initial pattern not validated and we're not in cutting mode, just show detection
         if not self.initial_pattern_validated and not self.is_cutting:
@@ -914,134 +838,6 @@ class LaserFabricCutter:
                 color = (0, 0, 255)  # Red for valid cutting groups
                 for x, y in group:
                     cv2.circle(frame, (int(x), int(y)), 5, color, -1)
-        
-
-        
-        # Update the frame queue
-        self.calculate_loop_time()
-        self.update_frame_queue(frame, frame_queue)
-
-    def process_frame(self, frame, frame_queue):
-        """Process frame with improved detection and continuity checks"""
-        # Get current groups of points
-        current_groups = self.detect_and_group_points(frame)
-        
-        # Skip if no groups detected
-        if not current_groups:
-            self.update_frame_queue(frame, frame_queue)
-            return
-        
-        # Draw channel boundaries first
-        cv2.line(frame, (self.left_channel_start, self.slice_start), 
-                (self.left_channel_start, self.slice_end), (0, 255, 255), 2)
-        cv2.line(frame, (self.left_channel_end, self.slice_start), 
-                (self.left_channel_end, self.slice_end), (0, 255, 255), 2)
-        cv2.line(frame, (self.right_channel_start, self.slice_start), 
-                (self.right_channel_start, self.slice_end), (0, 255, 255), 2)
-        cv2.line(frame, (self.right_channel_end, self.slice_start), 
-                (self.right_channel_end, self.slice_end), (0, 255, 255), 2)
-        
-        # Ensure we have exactly 4 groups and they're properly ordered
-        if len(current_groups) != 4:
-            # Try to fix the groups if we don't have exactly 4
-            if len(current_groups) > 4:
-                # Keep only the 4 most significant groups
-                # Sort by number of points (more points = more significant)
-                current_groups.sort(key=lambda g: len(g), reverse=True)
-                current_groups = current_groups[:4]
-            elif len(current_groups) < 4:
-                # Try to infer missing groups
-                current_groups = self.infer_missing_groups(current_groups)
-        
-        # Sort groups by x-position (left to right)
-        current_groups.sort(key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
-        
-        # Assign consistent colors based on position, not group index
-        # This ensures the same edge always gets the same color
-        colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (255, 255, 0)]
-        
-        # Visualize the groups with consistent coloring
-        for i, group in enumerate(current_groups[:4]):  # Limit to 4 groups
-            color = colors[i]
-            # Draw each point in the group
-            for x, y in group:
-                cv2.circle(frame, (int(x), int(y)), 5, color, -1)
-            
-            # Optionally add group label
-            if group:
-                avg_x = sum(p[0] for p in group) / len(group)
-                avg_y = sum(p[1] for p in group) / len(group)
-                cv2.putText(frame, f"G{i+1}", (int(avg_x), int(avg_y - 10)), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        
-        # If initial pattern not validated and we're not in cutting mode, just show detection
-        if not self.initial_pattern_validated and not self.is_cutting:
-            self.update_frame_queue(frame, frame_queue)
-            return
-        
-        # Check continuity with previous valid groups when cutting is active
-        valid_groups = []
-        
-        if self.is_cutting and hasattr(self, 'previous_valid_groups') and self.previous_valid_groups:
-            # Calculate movement/deviation from previous frame
-            deviation_threshold = self.galvo_settings['point_daviation']
-            
-            for group in current_groups:
-                # Find closest previous group
-                group_center_x = sum(p[0] for p in group) / len(group)
-                
-                # Find the closest previous group by comparing centers
-                prev_centers = [sum(p[0] for p in g) / len(g) for g in self.previous_valid_groups]
-                closest_idx = min(range(len(prev_centers)), 
-                                key=lambda i: abs(prev_centers[i] - group_center_x))
-                
-                # Calculate average deviation
-                avg_deviation = 0
-                if self.previous_valid_groups[closest_idx]:
-                    deviations = []
-                    for p1 in group:
-                        closest_point = min(self.previous_valid_groups[closest_idx], 
-                                        key=lambda p2: math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2))
-                        deviations.append(math.sqrt((p1[0]-closest_point[0])**2 + 
-                                                (p1[1]-closest_point[1])**2))
-                    
-                    avg_deviation = sum(deviations) / len(deviations)
-                
-                # Accept the group if deviation is within threshold
-                if avg_deviation <= deviation_threshold or avg_deviation == 0:
-                    valid_groups.append(group)
-        else:
-            # No previous groups to compare with, accept all
-            valid_groups = current_groups
-        
-        # Update previous groups for next frame
-        if valid_groups:
-            self.previous_valid_groups = valid_groups.copy()
-        
-        # Process valid groups for galvo
-        if valid_groups and self.is_cutting:
-            # Clear previous points
-            self.previous_points.clear()
-            
-            # Process each group in sequence
-            for group_idx, group in enumerate(valid_groups):
-                # Convert to galvo coordinates
-                galvo_points = []
-                for x, y in group:
-                    adjusted_x = x + self.galvo_offset_x
-                    adjusted_y = y + self.galvo_offset_y + self.galvo_settings['offset_y']
-                    
-                    # Convert to hex coordinates
-                    x_hex, y_hex = self.pixel_to_galvo_coordinates(adjusted_x, adjusted_y)
-                    galvo_points.append((x_hex, y_hex))
-                
-                # Add points to processing queue with group metadata
-                self.process_point_group(galvo_points, group_idx)
-                
-                # Highlight the active cutting points with a different visual style
-                for x, y in group:
-                    # Draw a larger, hollow circle around points being cut
-                    cv2.circle(frame, (int(x), int(y)), 8, (0, 255, 255), 2)
         
         # Update the frame queue
         self.calculate_loop_time()

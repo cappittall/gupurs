@@ -23,7 +23,12 @@ GALVO_SETTINGS_DEFAULT = {
                     'cut_speed': 5000,
                     'laser_on_delay': 1,
                     'laser_off_delay': 1,
-                    'polygon_delay': 50
+                    'polygon_delay': 50,
+                    'offset_px': 25,  
+                    'left_channel_start': 72,
+                    'left_channel_end': 214,
+                    'right_channel_start': 714,
+                    'right_channel_end': 860
                 }
 
 class LaserCutterGUI:
@@ -174,7 +179,11 @@ class LaserCutterGUI:
 
         self.reset_button = ttk.Button(control_frame, text="Reset", command=self.reset)
         self.reset_button.pack(side=tk.LEFT, padx=5)
-
+        
+        # play/pause button to control frame
+        self.play_pause_button = ttk.Button(control_frame, text="Play", command=self.toggle_play_pause)
+        self.play_pause_button.pack(side=tk.LEFT, padx=5)
+          
         self.exit_button = ttk.Button(control_frame, text="Exit", command=self.exit_gui)
         self.exit_button.pack(side=tk.LEFT, padx=5)
 
@@ -199,7 +208,9 @@ class LaserCutterGUI:
         for setting, value in self.settings.items():
             frame = ttk.Frame(slider_frame)
             frame.pack(fill=tk.X, padx=5, pady=2)
-            
+            # channel or offset_px pass
+            if setting in ['left_channel_start', 'left_channel_end', 'right_channel_start', 'right_channel_end', 'offset_px']:
+                continue
             if setting == 'point_daviation':
                 label = tk.Label(frame, text=setting.replace('_', ' ').title(), width=12)
                 label.pack(side=tk.LEFT)
@@ -243,19 +254,110 @@ class LaserCutterGUI:
         self.sliders['cut_speed'].config(from_=1000, to=128000)
         self.sliders['frequency'].config(from_=20, to=200)
         self.sliders['power'].config(from_=0, to=100)
-        self.sliders['laser_on_delay'].config(from_=0, to=100)    # Optional increase
-        self.sliders['laser_off_delay'].config(from_=0, to=100)   # Optional increase
-        self.sliders['polygon_delay'].config(from_=0, to=50)      # Optional increase
+        self.sliders['laser_on_delay'].config(from_=0, to=100)    
+        self.sliders['laser_off_delay'].config(from_=0, to=100)  
+        self.sliders['polygon_delay'].config(from_=0, to=50)  
+
+   
                     
         # Add calibration status label
         self.calibration_status_label = ttk.Label(right_frame, textvariable=self.calibration_status)
         self.calibration_status_label.pack(fill=tk.X, pady=5)
     
+        # Add a new frame for channel selection in the right frame
+        channel_frame = ttk.LabelFrame(right_frame, text="Channel Selection")
+        channel_frame.pack(fill=tk.X, pady=5)
+        
+        # Left Channel
+        left_channel_frame = ttk.Frame(channel_frame)
+        left_channel_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(left_channel_frame, text="Left Channel", width=12).pack(side=tk.LEFT)
+        
+        left_start_frame = ttk.Frame(left_channel_frame)
+        left_start_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(left_start_frame, text="Start", width=8).pack(side=tk.LEFT)
+        self.left_start_value = ttk.Label(left_start_frame, text=str(self.settings['left_channel_start']), width=8)
+        self.left_start_value.pack(side=tk.RIGHT)
+        self.left_start_slider = ttk.Scale(left_start_frame, from_=0, to=1280, orient=tk.HORIZONTAL,
+                            command=lambda v: self.update_channel_setting('left_channel_start', v, self.left_start_value))
+        self.left_start_slider.set(self.settings['left_channel_start'])
+        self.left_start_slider.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(0, 5))
+        
+        left_end_frame = ttk.Frame(left_channel_frame)
+        left_end_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(left_end_frame, text="End", width=8).pack(side=tk.LEFT)
+        self.left_end_value = ttk.Label(left_end_frame, text=str(self.settings['left_channel_end']), width=8)
+        self.left_end_value.pack(side=tk.RIGHT)
+        self.left_end_slider = ttk.Scale(left_end_frame, from_=0, to=1280, orient=tk.HORIZONTAL,
+                        command=lambda v: self.update_channel_setting('left_channel_end', v, self.left_end_value))
+        self.left_end_slider.set(self.settings['left_channel_end'])
+        self.left_end_slider.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(0, 5))
+        
+        # Right Channel
+        right_channel_frame = ttk.Frame(channel_frame)
+        right_channel_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(right_channel_frame, text="Right Channel", width=12).pack(side=tk.LEFT)
+        
+        right_start_frame = ttk.Frame(right_channel_frame)
+        right_start_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(right_start_frame, text="Start", width=8).pack(side=tk.LEFT)
+        self.right_start_value = ttk.Label(right_start_frame, text=str(self.settings['right_channel_start']), width=8)
+        self.right_start_value.pack(side=tk.RIGHT)
+        self.right_start_slider = ttk.Scale(right_start_frame, from_=0, to=1280, orient=tk.HORIZONTAL,
+                            command=lambda v: self.update_channel_setting('right_channel_start', v, self.right_start_value))
+        self.right_start_slider.set(self.settings['right_channel_start'])
+        self.right_start_slider.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(0, 5))
+        
+        right_end_frame = ttk.Frame(right_channel_frame)
+        right_end_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(right_end_frame, text="End", width=8).pack(side=tk.LEFT)
+        self.right_end_value = ttk.Label(right_end_frame, text=str(self.settings['right_channel_end']), width=8)
+        self.right_end_value.pack(side=tk.RIGHT)
+        self.right_end_slider = ttk.Scale(right_end_frame, from_=0, to=1280, orient=tk.HORIZONTAL,
+                            command=lambda v: self.update_channel_setting('right_channel_end', v, self.right_end_value))
+        self.right_end_slider.set(self.settings['right_channel_end'])
+        self.right_end_slider.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(0, 5))
+        
+        # Add Offset PX slider
+        offset_frame = ttk.Frame(channel_frame)
+        offset_frame.pack(fill=tk.X, padx=5, pady=2)
+        ttk.Label(offset_frame, text="Offset PX", width=12).pack(side=tk.LEFT)
+        self.offset_value = ttk.Label(offset_frame, text=str(self.settings['offset_px']), width=8)
+        self.offset_value.pack(side=tk.RIGHT)
+        self.offset_slider = ttk.Scale(offset_frame, from_=1, to=50, orient=tk.HORIZONTAL,
+                        command=lambda v: self.update_channel_setting('offset_px', v, self.offset_value))
+        self.offset_slider.set(self.settings['offset_px'])
+        self.offset_slider.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(0, 5))
+
+    def update_channel_setting(self, setting_name, value, value_label):
+        value = int(float(value))
+        self.settings[setting_name] = value
+        value_label.config(text=f"{value}")
+        
+        if self.cutter:
+            # For offset_px, call the specific update method
+            if setting_name == 'offset_px':
+                self.cutter.update_offset_px(value)
+            # For channel boundaries, update all boundaries at once to maintain consistency
+            elif setting_name in ['left_channel_start', 'left_channel_end', 
+                                'right_channel_start', 'right_channel_end']:
+                self.cutter.update_channel_boundaries(
+                    self.settings['left_channel_start'],
+                    self.settings['left_channel_end'],
+                    self.settings['right_channel_start'],
+                    self.settings['right_channel_end']
+                )
+                
     def toggle_point_deviation(self):
         if self.cutter:
             self.cutter.use_point_deviation = self.use_point_deviation.get()
         print(f"Use Point Deviation: {self.use_point_deviation.get()}")
-    
+    def toggle_play_pause(self):
+        """Toggle between play and pause states"""
+        if self.cutter:
+            is_paused = self.cutter.toggle_pause()
+            self.play_pause_button.config(text="Play" if is_paused else "Pause")
+            
     def toggle_offset_calibration(self, event=None):
         self.calibration_mode = not self.calibration_mode
         status = "ON" if self.calibration_mode else "OFF"
@@ -428,7 +530,7 @@ class LaserCutterGUI:
                 self.video_writer.release()
                 self.video_writer = None
                 self.recording_filename = None
-
+                
     def reset(self):
         if self.cutter:
             self.cutter = None
@@ -443,24 +545,6 @@ class LaserCutterGUI:
         self.update_connection_status(False)
         self.display_area.delete('1.0', tk.END)
         self.display_area.insert(tk.END, "Width: 0.00 cm\nSpeed: 0.00 cm/min\nLoop Time: 0.0000 s")
-
-    def exit_guiX(self):
-        if self.is_cutting:
-            self.is_cutting = False
-            self.cutter.stop_cutting()
-            time.sleep(0.5)  # Wait for the cutter to stop
-        
-        # Perform any necessary cleanup
-        if self.cutter:
-            self.cutter.stop_processing()  # Stop the laser cutter if running
-            self.cutter.cleanup()  # Call the new cleanup method
-        if self.video_writer:
-            self.video_writer.release()
-            self.video_writer = None
-            
-        self.master.quit()  # Close the GUI application
-        self.master.destroy()  # Destroy the Tkinter root window
-        sys.exit()  # Exit the program
 
     def exit_gui(self):
         try:
