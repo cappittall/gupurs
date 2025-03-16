@@ -12,9 +12,6 @@ import queue
 import sys
 from scipy.interpolate import splprep, splev
 
-
-
-
 #sys.path.append('/home/yordam/balor') 
 sys.path.append('../balor')
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'balor')))
@@ -346,7 +343,385 @@ class LaserFabricCutter:
             return np.zeros((480, 640, 3), dtype=np.uint8)
         return self.current_frame
         
+    def infer_missing_groups(self, groups):
+        """Infer missing groups based on spacing pattern"""
+        if len(groups) >= 4:
+            return groups
+        
+        # Sort by x-position
+        sorted_groups = sorted(groups, key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
+        
+        # Get centers of known groups
+        group_centers = [sum(p[0] for p in g)/len(g) for g in sorted_groups]
+        
+        # If we have at least 2 groups, we can estimate spacing
+        if len(sorted_groups) >= 2:
+            # Calculate available spacings
+            spacings = [group_centers[i+1] - group_centers[i] for i in range(len(group_centers)-1)]
+            avg_spacing = sum(spacings) / len(spacings)
             
+            # Create template for missing groups
+            template_group = None
+            avg_points = sum(len(g) for g in sorted_groups) / len(sorted_groups)
+            
+            # Use the group with points count closest to average as template
+            min_diff = float('inf')
+            for group in sorted_groups:
+                diff = abs(len(group) - avg_points)
+                if diff < min_diff:
+                    min_diff = diff
+                    template_group = group
+            
+            # Get y-coordinates from template
+            template_y = [p[1] for p in template_group]
+            
+            # Complete the pattern to 4 groups
+            complete_groups = sorted_groups.copy()
+            frame_width = 640  # Assuming standard width, adjust if needed
+            
+            # Case 1: Missing a group on the left
+            if len(group_centers) >= 2 and (group_centers[0] - avg_spacing > 0):
+                # Infer a group to the left of the first group
+                inferred_center = group_centers[0] - avg_spacing
+                inferred_group = [(inferred_center, y) for y in template_y]
+                complete_groups.append(inferred_group)
+            
+            # Case 2: Missing a group on the right
+            if len(group_centers) >= 2 and (group_centers[-1] + avg_spacing < frame_width):
+                # Infer a group to the right of the last group
+                inferred_center = group_centers[-1] + avg_spacing
+                inferred_group = [(inferred_center, y) for y in template_y]
+                complete_groups.append(inferred_group)
+            
+            # Case 3: Missing a group in the middle
+            if len(group_centers) >= 2:
+                for i in range(len(group_centers) - 1):
+                    current_spacing = group_centers[i+1] - group_centers[i]
+                    # If space between centers is significantly larger than average, infer a group
+                    if current_spacing > 1.5 * avg_spacing:
+                        inferred_center = group_centers[i] + avg_spacing
+                        inferred_group = [(inferred_center, y) for y in template_y]
+                        complete_groups.append(inferred_group)
+            
+            # Re-sort the groups
+            complete_groups = sorted(complete_groups, key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
+            
+            # If we still don't have 4 groups, try one more time with updated spacing
+            if len(complete_groups) < 4:
+                # Recalculate centers and spacing
+                group_centers = [sum(p[0] for p in g)/len(g) for g in complete_groups]
+                spacings = [group_centers[i+1] - group_centers[i] for i in range(len(group_centers)-1)]
+                if spacings:
+                    avg_spacing = sum(spacings) / len(spacings)
+                    
+                    # Try to infer groups at both ends if needed
+                    while len(complete_groups) < 4:
+                        # Decide whether to add to left or right based on frame boundaries
+                        if group_centers[0] - avg_spacing > 0:
+                            # Add to left
+                            inferred_center = group_centers[0] - avg_spacing
+                            inferred_group = [(inferred_center, y) for y in template_y]
+                            complete_groups.append(inferred_group)
+                        elif group_centers[-1] + avg_spacing < frame_width:
+                            # Add to right
+                            inferred_center = group_centers[-1] + avg_spacing
+                            inferred_group = [(inferred_center, y) for y in template_y]
+                            complete_groups.append(inferred_group)
+                        else:
+                            # Can't add more groups within frame
+                            break
+                        
+                        # Update centers
+                        complete_groups = sorted(complete_groups, key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
+                        group_centers = [sum(p[0] for p in g)/len(g) for g in complete_groups]
+        
+        # Return what we have (may or may not be 4 groups)
+        return sorted(complete_groups, key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)[:4]
+
+    def display_validation_result(self, frame, groups, is_valid, message):
+        """Display validation results on the frame"""
+        for i, group in enumerate(groups):
+            # Use different colors for each group
+            colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (255, 255, 0)]
+            color = colors[i % len(colors)]
+            
+            # Draw points and add group labels
+            for x, y in group:
+                cv2.circle(frame, (int(x), int(y)), 5, color, -1)
+            
+            # Add group label
+            if group:
+                avg_x = sum(p[0] for p in group) / len(group)
+                avg_y = sum(p[1] for p in group) / len(group)
+                
+                # For inferred groups, add "(inferred)" to the label
+                is_inferred = i >= len(groups) - (4 - len(set(tuple(p) for g in groups for p in g)))
+                label = f"Group {i+1}"
+                if is_inferred:
+                    label += " (inferred)"
+                    
+                cv2.putText(frame, label, (int(avg_x), int(avg_y - 10)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        # Add message at the top
+        cv2.putText(frame, message, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 
+                (0, 0, 255) if not is_valid else (0, 255, 0), 2)
+        
+        # Push the visualization frame to the queue
+        if hasattr(self, 'frame_queue') and self.frame_queue is not None:
+            try:
+                while not self.frame_queue.empty():
+                    self.frame_queue.get_nowait()
+                self.frame_queue.put(frame.copy())
+            except Exception as e:
+                print(f"Error updating frame queue: {e}")
+                
+        # Store validation frame
+        self.validation_frame = frame.copy()
+      
+    def detect_and_group_points(self, frame):
+        """Process frame to detect and group points by x-coordinate proximity within allowed channels"""
+        slice_img = frame[self.slice_start:self.slice_end, :]
+        
+        # Apply existing image processing steps
+        gray = cv2.cvtColor(slice_img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, thresh = cv2.threshold(blurred, 120, 255, cv2.THRESH_BINARY_INV)
+        
+        # Find contours
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Filter valid contours
+        valid_contours = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            x, y, w, h = cv2.boundingRect(cnt)
+            
+            # Check if contour is within the allowed channel boundaries
+            contour_center_x = x + w/2
+            is_in_left_channel = (contour_center_x >= self.left_channel_start and 
+                                contour_center_x <= self.left_channel_end)
+            is_in_right_channel = (contour_center_x >= self.right_channel_start and 
+                                contour_center_x <= self.right_channel_end)
+            
+            if area > 500 and h > self.slice_height*0.8 and (is_in_left_channel or is_in_right_channel):
+                valid_contours.append(cnt)
+        
+        # Extract centerline points from each contour
+        all_points = []
+        for cnt in valid_contours:
+            mask = np.zeros_like(gray)
+            cv2.drawContours(mask, [cnt], -1, 255, -1)
+            
+            for y in range(self.slice_height):
+                row = mask[y,:]
+                if np.any(row):
+                    left = np.argmax(row)
+                    right = len(row) - np.argmax(row[::-1]) - 1
+                    cx = (left + right) // 2
+                    all_points.append((cx - self.offset_px, y + self.slice_start))
+                    all_points.append((cx + self.offset_px, y + self.slice_start))
+        
+        # If no points detected, return empty list
+        if not all_points:
+            return []
+        
+        # Group points using improved clustering
+        return self.cluster_points_into_four_groups(all_points)
+
+    def cluster_points_into_four_groups(self, points):
+        """
+        Cluster points into exactly four groups using a combination of
+        spatial clustering and domain knowledge about the expected pattern.
+        """
+        # Sort points by x-coordinate
+        points.sort(key=lambda p: p[0])
+        
+        # Step 1: Initial clustering based on x-coordinate gaps
+        x_values = [p[0] for p in points]
+        
+        # Calculate gaps between adjacent x-coordinates
+        gaps = [x_values[i+1] - x_values[i] for i in range(len(x_values)-1)]
+        if not gaps:
+            return [points]  # Only one group if no gaps
+        
+        # Step 2: Use k-means clustering to find 4 clusters
+        try:
+            # Convert points to numpy array for k-means
+            points_array = np.array(points)
+            
+            # Use only x-coordinates for clustering
+            x_coords = points_array[:, 0].reshape(-1, 1)
+            
+            # Apply k-means with k=4
+            from sklearn.cluster import KMeans
+            kmeans = KMeans(n_clusters=4, random_state=0, n_init=10).fit(x_coords)
+            
+            # Get cluster labels
+            labels = kmeans.labels_
+            
+            # Create groups based on cluster labels
+            groups = [[] for _ in range(4)]
+            for i, point in enumerate(points):
+                groups[labels[i]].append(point)
+            
+            # Sort groups by x-coordinate (left to right)
+            groups.sort(key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
+            
+        except Exception as e:
+            # Fallback method if k-means fails
+            print(f"K-means clustering failed: {e}. Using fallback method.")
+            
+            # Find the 3 largest gaps to separate 4 groups
+            if len(gaps) >= 3:
+                gap_indices = sorted(range(len(gaps)), key=lambda i: gaps[i], reverse=True)[:3]
+                gap_indices.sort()  # Sort in ascending order
+                
+                groups = []
+                start_idx = 0
+                for gap_idx in gap_indices:
+                    groups.append(points[start_idx:gap_idx+1])
+                    start_idx = gap_idx + 1
+                groups.append(points[start_idx:])
+            else:
+                # Not enough gaps, try to infer 4 groups based on expected pattern
+                groups = self.infer_four_groups(points)
+        
+        # Step 3: Optimize each group by reducing redundant points
+        optimized_groups = []
+        for group in groups:
+            optimized_group = self.optimize_point_group(group)
+            if optimized_group:  # Only add non-empty groups
+                optimized_groups.append(optimized_group)
+        
+        # Step 4: Ensure we have exactly 4 groups
+        while len(optimized_groups) > 4:
+            # Merge the two closest groups
+            min_distance = float('inf')
+            merge_indices = (0, 1)
+            
+            for i in range(len(optimized_groups)):
+                for j in range(i+1, len(optimized_groups)):
+                    g1_center = sum(p[0] for p in optimized_groups[i])/len(optimized_groups[i])
+                    g2_center = sum(p[0] for p in optimized_groups[j])/len(optimized_groups[j])
+                    distance = abs(g1_center - g2_center)
+                    
+                    if distance < min_distance:
+                        min_distance = distance
+                        merge_indices = (i, j)
+            
+            # Merge the two closest groups
+            i, j = merge_indices
+            optimized_groups[i].extend(optimized_groups[j])
+            optimized_groups.pop(j)
+        
+        # If we have fewer than 4 groups, try to infer the missing ones
+        while len(optimized_groups) < 4:
+            optimized_groups = self.infer_missing_groups(optimized_groups)
+            if len(optimized_groups) == len(self.infer_missing_groups(optimized_groups)):
+                # If inference didn't add any new groups, break to avoid infinite loop
+                break
+        
+        # Final sort by x-coordinate
+        optimized_groups.sort(key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
+        
+        return optimized_groups[:4]  # Return at most 4 groups
+
+    def optimize_point_group(self, points, max_points=10):
+        """
+        Optimize a group of points by:
+        1. Removing points that are too close to each other
+        2. Ensuring even distribution along the y-axis
+        3. Limiting the total number of points for efficiency
+        """
+        if not points:
+            return []
+        
+        # Sort points by y-coordinate (top to bottom)
+        points.sort(key=lambda p: p[1])
+        
+        # If we have few points, keep them all
+        if len(points) <= max_points:
+            return points
+        
+        # For larger groups, sample points evenly along the y-axis
+        optimized_points = []
+        
+        # Always include the first and last points
+        optimized_points.append(points[0])
+        
+        # Sample the middle points
+        step = (len(points) - 2) / (max_points - 2)
+        for i in range(1, max_points - 1):
+            idx = min(int(i * step), len(points) - 2)
+            optimized_points.append(points[idx])
+        
+        # Add the last point
+        optimized_points.append(points[-1])
+        
+        # Apply smoothing to the points if needed
+        if len(optimized_points) >= 3:
+            optimized_points = self.smooth_points(optimized_points)
+        
+        return optimized_points
+
+    def smooth_points(self, points, smoothness=0.2):
+        """
+        Apply smoothing to a series of points to create a more natural curve.
+        Uses scipy's spline interpolation.
+        """
+        try:
+            # Extract x and y coordinates
+            x = [p[0] for p in points]
+            y = [p[1] for p in points]
+            
+            # Check if we have enough unique points for spline
+            if len(set(y)) < 3:
+                return points  # Not enough unique points, return original
+            
+            # Create the spline
+            tck, u = splprep([x, y], s=smoothness, k=min(3, len(points)-1))
+            
+            # Evaluate the spline at evenly spaced points
+            new_u = np.linspace(0, 1, len(points))
+            new_points = splev(new_u, tck)
+            
+            # Convert back to the original format
+            smoothed_points = [(int(round(new_points[0][i])), int(round(new_points[1][i]))) 
+                            for i in range(len(new_points[0]))]
+            
+            return smoothed_points
+        except Exception as e:
+            print(f"Smoothing failed: {e}")
+            return points  # Return original points if smoothing fails
+
+    def infer_four_groups(self, points):
+        """
+        Attempt to infer 4 groups based on the expected pattern of two channels
+        with left and right edges.
+        """
+        # Calculate the frame width
+        frame_width = 1280  # Default width, adjust if needed
+        
+        # Divide the frame into 4 equal sections as a starting point
+        section_width = frame_width / 4
+        
+        groups = [[] for _ in range(4)]
+        
+        # Assign points to sections based on x-coordinate
+        for point in points:
+            section = min(3, int(point[0] / section_width))
+            groups[section].append(point)
+        
+        # Filter out empty groups
+        groups = [g for g in groups if g]
+        
+        # If we have fewer than 4 groups, try to infer the missing ones
+        if len(groups) < 4:
+            return self.infer_missing_groups(groups)
+        
+        return groups
+                
     def process_video(self, frame_queue=None):
         print("Starting video processing...")
         if frame_queue is None:
@@ -438,541 +813,8 @@ class LaserFabricCutter:
         finally:
             if hasattr(self, 'cap') and self.cap is not None:
                 self.cap.release()
-    
-    def detect_and_group_points(self, frame):
-        """Process frame to detect and group points by x-coordinate proximity within allowed channels"""
-        slice_img = frame[self.slice_start:self.slice_end, :]
-        
-        # Apply existing image processing steps
-        gray = cv2.cvtColor(slice_img, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, thresh = cv2.threshold(blurred, 120, 255, cv2.THRESH_BINARY_INV)
-        
-        # Find contours
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Filter valid contours
-        valid_contours = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            x, y, w, h = cv2.boundingRect(cnt)
-            
-            # Check if contour is within the allowed channel boundaries
-            contour_center_x = x + w/2
-            is_in_left_channel = (contour_center_x >= self.left_channel_start and 
-                                contour_center_x <= self.left_channel_end)
-            is_in_right_channel = (contour_center_x >= self.right_channel_start and 
-                                contour_center_x <= self.right_channel_end)
-            
-            if area > 500 and h > self.slice_height*0.8 and (is_in_left_channel or is_in_right_channel):
-                valid_contours.append(cnt)
-        
-        # Extract centerline points from each contour
-        left_channel_points = []
-        right_channel_points = []
-        
-        for cnt in valid_contours:
-            mask = np.zeros_like(gray)
-            cv2.drawContours(mask, [cnt], -1, 255, -1)
-            
-            # Get contour center to determine which channel it belongs to
-            M = cv2.moments(cnt)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-            else:
-                x, _, w, _ = cv2.boundingRect(cnt)
-                cx = x + w//2
-                
-            is_left_channel = (cx >= self.left_channel_start and cx <= self.left_channel_end)
-            
-            for y in range(self.slice_height):
-                row = mask[y,:]
-                if np.any(row):
-                    left = np.argmax(row)
-                    right = len(row) - np.argmax(row[::-1]) - 1
-                    center_x = (left + right) // 2
-                    
-                    # Add points with offset to the appropriate channel
-                    if is_left_channel:
-                        # Only add if the points are within the left channel boundaries
-                        if self.left_channel_start <= center_x - self.offset_px <= self.left_channel_end:
-                            left_channel_points.append((center_x - self.offset_px, y + self.slice_start))
-                        if self.left_channel_start <= center_x + self.offset_px <= self.left_channel_end:
-                            left_channel_points.append((center_x + self.offset_px, y + self.slice_start))
-                    else:
-                        # Only add if the points are within the right channel boundaries
-                        if self.right_channel_start <= center_x - self.offset_px <= self.right_channel_end:
-                            right_channel_points.append((center_x - self.offset_px, y + self.slice_start))
-                        if self.right_channel_start <= center_x + self.offset_px <= self.right_channel_end:
-                            right_channel_points.append((center_x + self.offset_px, y + self.slice_start))
-        
-        # Process each channel separately to find exactly 2 groups per channel
-        left_groups = self.find_two_groups_in_channel(left_channel_points)
-        right_groups = self.find_two_groups_in_channel(right_channel_points)
-        
-        # Combine the groups from both channels
-        all_groups = left_groups + right_groups
-        
-        # If we don't have enough groups, try to infer the missing ones
-        if len(all_groups) < 4:
-            all_groups = self.infer_missing_groups(all_groups)
-        
-        # Sort all groups by x-position
-        all_groups.sort(key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
-        
-        return all_groups[:4]  # Return at most 4 groups
 
-    def find_two_groups_in_channel(self, points):
-        """Find exactly two groups of points within a single channel"""
-        if not points:
-            return []
-            
-        # If we have very few points, just return them as a single group
-        if len(points) < 6:
-            return [points]
-        
-        try:
-            # Convert points to numpy array
-            points_array = np.array(points)
-            
-            # Use only x-coordinates for clustering
-            x_coords = points_array[:, 0].reshape(-1, 1)
-            
-            # Always try to find 2 clusters within each channel
-            from sklearn.cluster import KMeans
-            kmeans = KMeans(n_clusters=2, random_state=0, n_init=10).fit(x_coords)
-            
-            # Get cluster labels
-            labels = kmeans.labels_
-            
-            # Create groups based on cluster labels
-            groups = [[] for _ in range(2)]
-            for i, point in enumerate(points):
-                groups[labels[i]].append(point)
-            
-            # Filter out empty groups
-            groups = [g for g in groups if g]
-            
-            # Sort groups by x-coordinate
-            groups.sort(key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
-            
-            # Optimize each group
-            optimized_groups = []
-            for group in groups:
-                optimized_group = self.optimize_point_group(group)
-                if optimized_group:
-                    optimized_groups.append(optimized_group)
-                    
-            return optimized_groups
-            
-        except Exception as e:
-            print(f"Error finding groups in channel: {e}")
-            
-            # Fallback: sort by x-coordinate and split in the middle
-            points.sort(key=lambda p: p[0])
-            mid = len(points) // 2
-            
-            group1 = self.optimize_point_group(points[:mid])
-            group2 = self.optimize_point_group(points[mid:])
-            
-            return [group1, group2] if group1 and group2 else [points]
-
-    def cluster_points_into_four_groups(self, points):
-        """
-        Cluster points into exactly four groups using a combination of
-        spatial clustering and domain knowledge about the expected pattern.
-        """
-        # Sort points by x-coordinate
-        points.sort(key=lambda p: p[0])
-        
-        # Step 1: Initial clustering based on x-coordinate gaps
-        x_values = [p[0] for p in points]
-        
-        # Calculate gaps between adjacent x-coordinates
-        gaps = [x_values[i+1] - x_values[i] for i in range(len(x_values)-1)]
-        if not gaps:
-            return [points]  # Only one group if no gaps
-        
-        # Step 2: Use k-means clustering to find clusters
-        try:
-            # Convert points to numpy array for k-means
-            points_array = np.array(points)
-            
-            # Use only x-coordinates for clustering
-            x_coords = points_array[:, 0].reshape(-1, 1)
-            
-            # Determine the number of clusters to use
-            # First, try to estimate the number of natural clusters
-            from sklearn.cluster import KMeans
-            from sklearn.metrics import silhouette_score
-            
-            # Try different numbers of clusters (2-4) and pick the best
-            best_score = -1
-            best_k = 2
-            for k in range(2, 5):
-                try:
-                    kmeans = KMeans(n_clusters=k, random_state=0, n_init=10).fit(x_coords)
-                    if len(np.unique(kmeans.labels_)) > 1:  # Ensure we have at least 2 clusters
-                        score = silhouette_score(x_coords, kmeans.labels_)
-                        if score > best_score:
-                            best_score = score
-                            best_k = k
-                except:
-                    continue
-            
-            # Apply k-means with the best k
-            kmeans = KMeans(n_clusters=best_k, random_state=0, n_init=10).fit(x_coords)
-            
-            # Get cluster labels
-            labels = kmeans.labels_
-            
-            # Create groups based on cluster labels
-            groups = [[] for _ in range(best_k)]
-            for i, point in enumerate(points):
-                groups[labels[i]].append(point)
-            
-            # Sort groups by x-coordinate (left to right)
-            groups.sort(key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
-            
-        except Exception as e:
-            # Fallback method if k-means fails
-            print(f"K-means clustering failed: {e}. Using fallback method.")
-            
-            # Find the largest gaps to separate groups
-            if len(gaps) >= 1:
-                # Sort gaps by size (largest first)
-                gap_indices = sorted(range(len(gaps)), key=lambda i: gaps[i], reverse=True)
-                
-                # Use the number of large gaps to determine number of groups
-                # (at most 3 gaps for 4 groups)
-                num_gaps = min(3, len(gap_indices))
-                gap_indices = sorted(gap_indices[:num_gaps])
-                
-                groups = []
-                start_idx = 0
-                for gap_idx in gap_indices:
-                    groups.append(points[start_idx:gap_idx+1])
-                    start_idx = gap_idx + 1
-                groups.append(points[start_idx:])
-            else:
-                # Not enough gaps, just use one group
-                groups = [points]
-        
-        # Step 3: Optimize each group by reducing redundant points
-        optimized_groups = []
-        for group in groups:
-            if group:  # Only process non-empty groups
-                optimized_group = self.optimize_point_group(group)
-                if optimized_group:  # Only add non-empty groups
-                    optimized_groups.append(optimized_group)
-        
-        # Step 4: Ensure we have exactly 4 groups
-        while len(optimized_groups) > 4:
-            # Merge the two closest groups
-            min_distance = float('inf')
-            merge_indices = (0, 1)
-            
-            for i in range(len(optimized_groups)):
-                for j in range(i+1, len(optimized_groups)):
-                    if optimized_groups[i] and optimized_groups[j]:  # Check for non-empty groups
-                        g1_center = sum(p[0] for p in optimized_groups[i])/len(optimized_groups[i])
-                        g2_center = sum(p[0] for p in optimized_groups[j])/len(optimized_groups[j])
-                        distance = abs(g1_center - g2_center)
-                        
-                        if distance < min_distance:
-                            min_distance = distance
-                            merge_indices = (i, j)
-            
-            # Merge the two closest groups
-            i, j = merge_indices
-            optimized_groups[i].extend(optimized_groups[j])
-            optimized_groups.pop(j)
-        
-        # If we have fewer than 4 groups, try to infer the missing ones
-        while len(optimized_groups) < 4:
-            new_groups = self.infer_missing_groups(optimized_groups)
-            if len(new_groups) == len(optimized_groups):
-                # If inference didn't add any new groups, break to avoid infinite loop
-                break
-            optimized_groups = new_groups
-        
-        # Final sort by x-coordinate
-        optimized_groups.sort(key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
-        
-        # Ensure all groups have valid points
-        for i in range(len(optimized_groups)):
-            if not optimized_groups[i]:
-                # Replace empty group with a dummy point that won't be drawn
-                # This prevents errors when trying to draw circles
-                optimized_groups[i] = [(-1000, -1000)]
-        
-        return optimized_groups[:4]  # Return at most 4 groups
-
-
-    def infer_missing_groups(self, groups):
-        """Infer missing groups based on spacing pattern"""
-        if len(groups) >= 4:
-            return groups
-        
-        # Initialize complete_groups at the beginning to avoid UnboundLocalError
-        complete_groups = groups.copy()
-        
-        # Sort by x-position
-        sorted_groups = sorted(groups, key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
-        
-        # Get centers of known groups
-        group_centers = [sum(p[0] for p in g)/len(g) for g in sorted_groups]
-        
-        # If we have at least 2 groups, we can estimate spacing
-        if len(sorted_groups) >= 2:
-            # Calculate available spacings
-            spacings = [group_centers[i+1] - group_centers[i] for i in range(len(group_centers)-1)]
-            avg_spacing = sum(spacings) / len(spacings)
-            
-            # Create template for missing groups
-            template_group = None
-            avg_points = sum(len(g) for g in sorted_groups) / len(sorted_groups)
-            
-            # Use the group with points count closest to average as template
-            min_diff = float('inf')
-            for group in sorted_groups:
-                diff = abs(len(group) - avg_points)
-                if diff < min_diff:
-                    min_diff = diff
-                    template_group = group
-            
-            # Get y-coordinates from template
-            template_y = [p[1] for p in template_group]
-            
-            # Complete the pattern to 4 groups
-            complete_groups = sorted_groups.copy()
-            frame_width = 1280  # Assuming standard width, adjust if needed
-            
-            # Case 1: Missing a group on the left
-            if len(group_centers) >= 2 and (group_centers[0] - avg_spacing > 0):
-                # Infer a group to the left of the first group
-                inferred_center = group_centers[0] - avg_spacing
-                inferred_group = [(inferred_center, y) for y in template_y]
-                complete_groups.append(inferred_group)
-            
-            # Case 2: Missing a group on the right
-            if len(group_centers) >= 2 and (group_centers[-1] + avg_spacing < frame_width):
-                # Infer a group to the right of the last group
-                inferred_center = group_centers[-1] + avg_spacing
-                inferred_group = [(inferred_center, y) for y in template_y]
-                complete_groups.append(inferred_group)
-            
-            # Case 3: Missing a group in the middle
-            if len(group_centers) >= 2:
-                for i in range(len(group_centers) - 1):
-                    current_spacing = group_centers[i+1] - group_centers[i]
-                    # If space between centers is significantly larger than average, infer a group
-                    if current_spacing > 1.5 * avg_spacing:
-                        inferred_center = group_centers[i] + avg_spacing
-                        inferred_group = [(inferred_center, y) for y in template_y]
-                        complete_groups.append(inferred_group)
-            
-            # Re-sort the groups
-            complete_groups.sort(key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
-            
-            # If we still don't have 4 groups, try one more time with updated spacing
-            if len(complete_groups) < 4:
-                # Recalculate centers and spacing
-                group_centers = [sum(p[0] for p in g)/len(g) for g in complete_groups]
-                spacings = [group_centers[i+1] - group_centers[i] for i in range(len(group_centers)-1)]
-                if spacings:
-                    avg_spacing = sum(spacings) / len(spacings)
-                    
-                    # Try to infer groups at both ends if needed
-                    while len(complete_groups) < 4:
-                        # Decide whether to add to left or right based on frame boundaries
-                        if group_centers[0] - avg_spacing > 0:
-                            # Add to left
-                            inferred_center = group_centers[0] - avg_spacing
-                            inferred_group = [(inferred_center, y) for y in template_y]
-                            complete_groups.append(inferred_group)
-                        elif group_centers[-1] + avg_spacing < frame_width:
-                            # Add to right
-                            inferred_center = group_centers[-1] + avg_spacing
-                            inferred_group = [(inferred_center, y) for y in template_y]
-                            complete_groups.append(inferred_group)
-                        else:
-                            # Can't add more groups within frame
-                            break
-                        
-                        # Update centers
-                        complete_groups.sort(key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
-                        group_centers = [sum(p[0] for p in g)/len(g) for g in complete_groups]
-        else:
-            # If we have fewer than 2 groups, we need a different approach
-            if len(sorted_groups) == 1 and sorted_groups[0]:
-                # We have only one group, try to infer the other three
-                template_group = sorted_groups[0]
-                template_y = [p[1] for p in template_group]
-                
-                # Get the center of the existing group
-                center_x = sum(p[0] for p in template_group) / len(template_group)
-                
-                # Estimate spacing based on channel width
-                estimated_spacing = (self.right_channel_start - self.left_channel_end) / 3
-                
-                # Create three more groups
-                for i in range(1, 4):
-                    # Alternate between left and right of the existing group
-                    if i % 2 == 1:
-                        # Add to right
-                        new_center = center_x + (i * estimated_spacing)
-                    else:
-                        # Add to left
-                        new_center = center_x - (i * estimated_spacing)
-                    
-                    # Ensure the new center is within frame
-                    if 0 < new_center < 1280:
-                        inferred_group = [(new_center, y) for y in template_y]
-                        complete_groups.append(inferred_group)
-                
-                # Re-sort the groups
-                complete_groups.sort(key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
-            else:
-                # No valid groups to infer from, create dummy groups
-                dummy_group = [(-1000, -1000)]  # Off-screen point
-                while len(complete_groups) < 4:
-                    complete_groups.append(dummy_group.copy())
-        
-        # Return what we have (may or may not be 4 groups)
-        return sorted(complete_groups, key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)[:4]
-
-    def optimize_point_group(self, points, max_points=10):
-        """
-        Optimize a group of points by:
-        1. Fitting points to a straight line using linear regression
-        2. Generating evenly spaced points along this line
-        3. Limiting the total number of points for efficiency
-        """
-        if not points or len(points) < 2:
-            return points
-        
-        # Sort points by y-coordinate (top to bottom)
-        points.sort(key=lambda p: p[1])
-        
-        # If we have few points, still apply linear regression
-        if len(points) <= 3:
-            # Need at least 2 points for regression
-            return self.linearize_points(points, max_points)
-        
-        # For larger groups, use linear regression to create a straight line
-        return self.linearize_points(points, max_points)
-
-    def linearize_points(self, points, num_points=10):
-        """
-        Convert a potentially scattered group of points into a straight line
-        using linear regression, then generate evenly spaced points along this line.
-        """
-        if len(points) < 2:
-            return points
-        
-        try:
-            # Extract x and y coordinates
-            x_coords = np.array([p[0] for p in points])
-            y_coords = np.array([p[1] for p in points])
-            
-            # Check if points are more vertical or horizontal
-            y_range = max(y_coords) - min(y_coords)
-            x_range = max(x_coords) - min(x_coords)
-            
-            if y_range > x_range:
-                # More vertical - fit y = mx + b
-                # Reshape for sklearn
-                x_for_fit = x_coords.reshape(-1, 1)
-                
-                # Use linear regression to find the best fit line
-                from sklearn.linear_model import LinearRegression
-                model = LinearRegression()
-                model.fit(x_for_fit, y_coords)
-                
-                # Get the slope and intercept
-                slope = model.coef_[0]
-                intercept = model.intercept_
-                
-                # Generate evenly spaced y-coordinates
-                min_y = min(y_coords)
-                max_y = max(y_coords)
-                new_y_coords = np.linspace(min_y, max_y, num_points)
-                
-                # Calculate corresponding x-coordinates using the line equation
-                # x = (y - b) / m
-                if slope != 0:
-                    new_x_coords = (new_y_coords - intercept) / slope
-                else:
-                    # If slope is 0 (horizontal line), use the average x
-                    new_x_coords = np.full_like(new_y_coords, np.mean(x_coords))
-                
-                # Create new points
-                linearized_points = [(int(round(x)), int(round(y))) 
-                                for x, y in zip(new_x_coords, new_y_coords)]
-            else:
-                # More horizontal - fit x = my + b (inverse regression)
-                # Reshape for sklearn
-                y_for_fit = y_coords.reshape(-1, 1)
-                
-                # Use linear regression to find the best fit line
-                from sklearn.linear_model import LinearRegression
-                model = LinearRegression()
-                model.fit(y_for_fit, x_coords)
-                
-                # Get the slope and intercept
-                slope = model.coef_[0]
-                intercept = model.intercept_
-                
-                # Generate evenly spaced x-coordinates
-                min_x = min(x_coords)
-                max_x = max(x_coords)
-                new_x_coords = np.linspace(min_x, max_x, num_points)
-                
-                # Calculate corresponding y-coordinates using the line equation
-                # y = (x - b) / m
-                if slope != 0:
-                    new_y_coords = (new_x_coords - intercept) / slope
-                else:
-                    # If slope is 0 (vertical line), use the average y
-                    new_y_coords = np.full_like(new_x_coords, np.mean(y_coords))
-                
-                # Create new points
-                linearized_points = [(int(round(x)), int(round(y))) 
-                                for x, y in zip(new_x_coords, new_y_coords)]
-            
-            return linearized_points
-            
-        except Exception as e:
-            print(f"Linearization failed: {e}")
-            # Fallback to simple sampling if regression fails
-            return self.simple_sample_points(points, num_points)
-        
-    def simple_sample_points(self, points, num_points):
-        """Simple fallback method to sample points evenly along y-axis"""
-        if len(points) <= num_points:
-            return points
-        
-        # Sort by y-coordinate
-        points.sort(key=lambda p: p[1])
-        
-        # Always include the first and last points
-        result = [points[0]]
-        
-        # Sample the middle points
-        if num_points > 2:
-            step = (len(points) - 2) / (num_points - 2)
-            for i in range(1, num_points - 1):
-                idx = min(int(i * step), len(points) - 2)
-                result.append(points[idx])
-        
-        # Add the last point
-        result.append(points[-1])
-        
-        return result
-
-
-    # TODO 
+    # TODO
     def process_frame(self, frame, frame_queue):
         """Process frame with improved detection and continuity checks"""
         # Get current groups of points
@@ -983,7 +825,7 @@ class LaserFabricCutter:
             self.update_frame_queue(frame, frame_queue)
             return
         
-        # Draw channel boundaries
+        # Draw channel boundaries first
         cv2.line(frame, (self.left_channel_start, self.slice_start), 
                 (self.left_channel_start, self.slice_end), (0, 255, 255), 2)
         cv2.line(frame, (self.left_channel_end, self.slice_start), 
@@ -993,26 +835,41 @@ class LaserFabricCutter:
         cv2.line(frame, (self.right_channel_end, self.slice_start), 
                 (self.right_channel_end, self.slice_end), (0, 255, 255), 2)
         
-        # Always visualize the detected groups, even if not cutting
+        # Ensure we have exactly 4 groups and they're properly ordered
+        if len(current_groups) != 4:
+            # Try to fix the groups if we don't have exactly 4
+            if len(current_groups) > 4:
+                # Keep only the 4 most significant groups
+                # Sort by number of points (more points = more significant)
+                current_groups.sort(key=lambda g: len(g), reverse=True)
+                current_groups = current_groups[:4]
+            elif len(current_groups) < 4:
+                # Try to infer missing groups
+                current_groups = self.infer_missing_groups(current_groups)
+        
+        # Sort groups by x-position (left to right)
+        current_groups.sort(key=lambda g: sum(p[0] for p in g)/len(g) if g else 0)
+        
+        # Assign consistent colors based on position, not group index
+        # This ensures the same edge always gets the same color
         colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (255, 255, 0)]
         
-        for i, group in enumerate(current_groups):
-            color = colors[i % len(colors)]
-            for point in group:
-                # Add safety check to ensure point is valid
-                try:
-                    x, y = point
-                    if isinstance(x, (int, float)) and isinstance(y, (int, float)):
-                        # Only draw points that are within the frame
-                        if 0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]:
-                            cv2.circle(frame, (int(x), int(y)), 5, color, -1)
-                except Exception as e:
-                    print(f"Error drawing point {point}: {e}")
-                    continue
+        # Visualize the groups with consistent coloring
+        for i, group in enumerate(current_groups[:4]):  # Limit to 4 groups
+            color = colors[i]
+            # Draw each point in the group
+            for x, y in group:
+                cv2.circle(frame, (int(x), int(y)), 5, color, -1)
+            
+            # Optionally add group label
+            if group:
+                avg_x = sum(p[0] for p in group) / len(group)
+                avg_y = sum(p[1] for p in group) / len(group)
+                cv2.putText(frame, f"G{i+1}", (int(avg_x), int(avg_y - 10)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
         # If initial pattern not validated and we're not in cutting mode, just show detection
         if not self.initial_pattern_validated and not self.is_cutting:
-            # Draw detection for visualization            
             self.update_frame_queue(frame, frame_queue)
             return
         
@@ -1024,44 +881,32 @@ class LaserFabricCutter:
             deviation_threshold = self.galvo_settings['point_daviation']
             
             for group in current_groups:
-                # Skip empty groups
-                if not group:
-                    continue
-                    
                 # Find closest previous group
-                try:
-                    group_center_x = sum(p[0] for p in group) / len(group)
+                group_center_x = sum(p[0] for p in group) / len(group)
+                
+                # Find the closest previous group by comparing centers
+                prev_centers = [sum(p[0] for p in g) / len(g) for g in self.previous_valid_groups]
+                closest_idx = min(range(len(prev_centers)), 
+                                key=lambda i: abs(prev_centers[i] - group_center_x))
+                
+                # Calculate average deviation
+                avg_deviation = 0
+                if self.previous_valid_groups[closest_idx]:
+                    deviations = []
+                    for p1 in group:
+                        closest_point = min(self.previous_valid_groups[closest_idx], 
+                                        key=lambda p2: math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2))
+                        deviations.append(math.sqrt((p1[0]-closest_point[0])**2 + 
+                                                (p1[1]-closest_point[1])**2))
                     
-                    # Find the closest previous group by comparing centers
-                    prev_centers = [sum(p[0] for p in g) / len(g) for g in self.previous_valid_groups if g]
-                    if not prev_centers:
-                        valid_groups.append(group)
-                        continue
-                        
-                    closest_idx = min(range(len(prev_centers)), 
-                                    key=lambda i: abs(prev_centers[i] - group_center_x))
-                    
-                    # Calculate average deviation
-                    avg_deviation = 0
-                    if self.previous_valid_groups[closest_idx]:
-                        deviations = []
-                        for p1 in group:
-                            closest_point = min(self.previous_valid_groups[closest_idx], 
-                                            key=lambda p2: math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2))
-                            deviations.append(math.sqrt((p1[0]-closest_point[0])**2 + 
-                                                    (p1[1]-closest_point[1])**2))
-                        
-                        avg_deviation = sum(deviations) / len(deviations)
-                    
-                    # Accept the group if deviation is within threshold
-                    if avg_deviation <= deviation_threshold or avg_deviation == 0:
-                        valid_groups.append(group)
-                except Exception as e:
-                    print(f"Error processing group: {e}")
-                    continue
+                    avg_deviation = sum(deviations) / len(deviations)
+                
+                # Accept the group if deviation is within threshold
+                if avg_deviation <= deviation_threshold or avg_deviation == 0:
+                    valid_groups.append(group)
         else:
             # No previous groups to compare with, accept all
-            valid_groups = [g for g in current_groups if g]
+            valid_groups = current_groups
         
         # Update previous groups for next frame
         if valid_groups:
@@ -1074,17 +919,9 @@ class LaserFabricCutter:
             
             # Process each group in sequence
             for group_idx, group in enumerate(valid_groups):
-                # Skip empty groups
-                if not group:
-                    continue
-                    
                 # Convert to galvo coordinates
                 galvo_points = []
                 for x, y in group:
-                    # Skip invalid points
-                    if not (isinstance(x, (int, float)) and isinstance(y, (int, float))):
-                        continue
-                        
                     adjusted_x = x + self.galvo_offset_x
                     adjusted_y = y + self.galvo_offset_y + self.galvo_settings['offset_y']
                     
@@ -1093,24 +930,52 @@ class LaserFabricCutter:
                     galvo_points.append((x_hex, y_hex))
                 
                 # Add points to processing queue with group metadata
-                if galvo_points:
-                    self.process_point_group(galvo_points, group_idx)
+                self.process_point_group(galvo_points, group_idx)
                 
-                # Draw the processed points
-                color = (0, 0, 255)  # Red for valid cutting groups
-                for point in group:
-                    try:
-                        x, y = point
-                        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
-                            if 0 <= x < frame.shape[1] and 0 <= y < frame.shape[0]:
-                                cv2.circle(frame, (int(x), int(y)), 5, color, -1)
-                    except Exception as e:
-                        print(f"Error highlighting point {point}: {e}")
-                        continue
+                # Highlight the active cutting points with a different visual style
+                for x, y in group:
+                    # Draw a larger, hollow circle around points being cut
+                    cv2.circle(frame, (int(x), int(y)), 8, (0, 255, 255), 2)
         
         # Update the frame queue
         self.calculate_loop_time()
         self.update_frame_queue(frame, frame_queue)
+        
+    def process_point_group(self, points, group_index):
+        """Process a group of points, optimizing galvo movement"""
+        if not points:
+            return
+            
+        # If this is a new group, first move to its starting point without cutting
+        first_point = points[0]
+        
+        # Queue the sequence: first move without cutting, then cut the entire group
+        if self.galvo_connection:
+            # First just move to the group's starting position
+            self.point_queue.put((first_point[0], first_point[1], False))  # False = no cutting
+            
+            # Then put all points with cutting enabled
+            for point in points:
+                self.point_queue.put((point[0], point[1], True))  # True = cutting
+
+    def is_valid_point(self, x, y):
+        if not self.use_point_deviation:
+            return True
+        
+        # Referance deviation point will be fixed until cutting is started.
+        if self.last_valid_x is None or self.last_valid_y is None or not self.is_cutting:
+            # First point is always valid
+            self.last_valid_x, self.last_valid_y = x, y
+            return True
+        
+        # Calculate distance from last valid point
+        distance = math.sqrt((x - self.last_valid_x)**2 + (y - self.last_valid_y)**2)
+
+        if distance <=  self.galvo_settings['point_daviation']:
+            return True
+        else:
+            print(f"Invalid point: {x}, {y}. Distance: {distance}")
+            return False
         
     def send_point_to_galvo(self, x_hex, y_hex):
         if not self.galvo_connection:
@@ -1319,4 +1184,4 @@ if __name__ == "__main__":
         cutter.cleanup()
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
-        cutter.cleanup()
+        cutter.cleanup()        

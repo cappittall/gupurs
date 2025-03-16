@@ -257,12 +257,6 @@ class LaserCutterGUI:
         self.sliders['laser_on_delay'].config(from_=0, to=100)    
         self.sliders['laser_off_delay'].config(from_=0, to=100)  
         self.sliders['polygon_delay'].config(from_=0, to=50)  
-
-   
-                    
-        # Add calibration status label
-        self.calibration_status_label = ttk.Label(right_frame, textvariable=self.calibration_status)
-        self.calibration_status_label.pack(fill=tk.X, pady=5)
     
         # Add a new frame for channel selection in the right frame
         channel_frame = ttk.LabelFrame(right_frame, text="Channel Selection")
@@ -328,6 +322,11 @@ class LaserCutterGUI:
                         command=lambda v: self.update_channel_setting('offset_px', v, self.offset_value))
         self.offset_slider.set(self.settings['offset_px'])
         self.offset_slider.pack(side=tk.RIGHT, expand=True, fill=tk.X, padx=(0, 5))
+        
+                            
+        # Add calibration status label
+        self.calibration_status_label = ttk.Label(right_frame, textvariable=self.calibration_status)
+        self.calibration_status_label.pack(fill=tk.X, pady=5)
 
     def update_channel_setting(self, setting_name, value, value_label):
         value = int(float(value))
